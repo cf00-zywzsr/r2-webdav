@@ -23,7 +23,22 @@ wrangler deploy
 
 wrangler secret put USERNAME
 wrangler secret put PASSWORD
+wrangler secret put SESSION_SECRET # recommended for browser login cookies
 ```
+
+Optional browser-session lifetime in seconds can be configured with `SESSION_MAX_AGE`; it defaults to 7 days and is capped at 30 days.
+
+## Browser login
+
+Opening the Worker URL in a browser now shows a dedicated login page instead of the browser's Basic Auth popup. Enter the same `USERNAME` and `PASSWORD` secrets there; WebDAV clients can still authenticate with Basic Auth.
+
+The browser UI also supports common object management actions:
+
+- create folders
+- delete files or folders
+- rename files or folders
+
+Browser sessions use a signed `HttpOnly` cookie, basic same-origin form checks, security response headers, and a small per-isolate login failure throttle. For public deployments, still consider Cloudflare WAF/rate-limiting rules in front of the Worker.
 
 ## Development
 

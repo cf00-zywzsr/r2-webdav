@@ -17,6 +17,8 @@ export interface Env {
 	// Variables defined in the "Environment Variables" section of the Wrangler CLI or dashboard
 	USERNAME: string;
 	PASSWORD: string;
+	SESSION_SECRET?: string;
+	SESSION_MAX_AGE?: string;
 }
 
 async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean = false) {
@@ -105,6 +107,18 @@ const RAW_XML_DAV_PROPERTIES = new Set(['resourcetype', 'supportedlock', 'lockdi
 const DAV_NAMESPACE = 'DAV:';
 const DEAD_PROPERTY_PREFIX = 'dead_property:';
 const LOCK_RECORDS_METADATA_KEY = 'lock_records';
+const LOGIN_PATH = '/__login';
+const LOGOUT_PATH = '/__logout';
+const ACTION_PREFIX = '/__actions';
+const MKDIR_ACTION_PATH = `${ACTION_PREFIX}/mkdir`;
+const DELETE_ACTION_PATH = `${ACTION_PREFIX}/delete`;
+const RENAME_ACTION_PATH = `${ACTION_PREFIX}/rename`;
+const AUTH_COOKIE_NAME = 'r2_webdav_session';
+const AUTH_SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60;
+const RESERVED_PATHS = new Set(['__login', '__logout', '__actions']);
+const LOGIN_RATE_LIMIT_WINDOW_SECONDS = 10 * 60;
+const LOGIN_RATE_LIMIT_MAX_FAILURES = 5;
+const loginAttempts = new Map<string, { failures: number; windowStartedAt: number; lockedUntil: number }>();
 
 function escapeXml(value: string): string {
 	return value
@@ -113,6 +127,11 @@ function escapeXml(value: string): string {
 		.replaceAll('>', '&gt;')
 		.replaceAll('"', '&quot;')
 		.replaceAll("'", '&apos;');
+}
+
+function isReservedResourcePath(resourcePath: string): boolean {
+	let firstSegment = resourcePath.split('/')[0];
+	return RESERVED_PATHS.has(firstSegment);
 }
 
 function getResourceHref(key: string, isCollection: boolean): string {
@@ -549,6 +568,545 @@ function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
 	return mismatch === 0;
 }
 
+function getCookieValue(cookieHeader: string | null, name: string): string | null {
+	if (cookieHeader === null) {
+		return null;
+	}
+	for (const cookie of cookieHeader.split(';')) {
+		let [cookieName, ...valueParts] = cookie.trim().split('=');
+		if (cookieName === name) {
+			try {
+				return decodeURIComponent(valueParts.join('='));
+			} catch {
+				return null;
+			}
+		}
+	}
+	return null;
+}
+
+function base64UrlEncode(bytes: Uint8Array): string {
+	let binary = '';
+	for (const byte of bytes) {
+		binary += String.fromCharCode(byte);
+	}
+	return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+}
+
+function getSessionSecret(env: Env): string {
+	return env.SESSION_SECRET ?? env.PASSWORD;
+}
+
+function getSessionMaxAgeSeconds(env: Env): number {
+	let configuredMaxAge = Number(env.SESSION_MAX_AGE);
+	if (!Number.isFinite(configuredMaxAge) || configuredMaxAge <= 0) {
+		return AUTH_SESSION_MAX_AGE_SECONDS;
+	}
+	return Math.min(Math.floor(configuredMaxAge), 30 * 24 * 60 * 60);
+}
+
+async function signSessionToken(username: string, sessionSecret: string, issuedAt: number): Promise<string> {
+	const encoder = new TextEncoder();
+	const key = await crypto.subtle.importKey(
+		'raw',
+		encoder.encode(sessionSecret),
+		{ name: 'HMAC', hash: 'SHA-256' },
+		false,
+		['sign'],
+	);
+	const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(`${username}:${issuedAt}`));
+	return `${issuedAt}.${base64UrlEncode(new Uint8Array(signature))}`;
+}
+
+async function createSessionCookie(
+	username: string,
+	sessionSecret: string,
+	sessionMaxAgeSeconds: number,
+	requestUrl: string,
+): Promise<string> {
+	let token = await signSessionToken(username, sessionSecret, Date.now());
+	let secure = new URL(requestUrl).protocol === 'https:' ? '; Secure' : '';
+	return `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${sessionMaxAgeSeconds}${secure}`;
+}
+
+function clearSessionCookie(requestUrl: string): string {
+	let secure = new URL(requestUrl).protocol === 'https:' ? '; Secure' : '';
+	return `${AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`;
+}
+
+function isCredentialPairAuthorized(
+	username: string,
+	password: string,
+	expectedUsername: string,
+	expectedPassword: string,
+): boolean {
+	const encoder = new TextEncoder();
+	return timingSafeEqual(
+		encoder.encode(`${username}:${password}`),
+		encoder.encode(`${expectedUsername}:${expectedPassword}`),
+	);
+}
+
+async function isValidSessionCookie(
+	cookieHeader: string | null,
+	username: string,
+	sessionSecret: string,
+	sessionMaxAgeSeconds: number,
+): Promise<boolean> {
+	let token = getCookieValue(cookieHeader, AUTH_COOKIE_NAME);
+	if (token === null) {
+		return false;
+	}
+
+	let tokenParts = token.split('.');
+	if (tokenParts.length !== 2) {
+		return false;
+	}
+
+	let [issuedAtText] = tokenParts;
+	let issuedAt = Number(issuedAtText);
+	if (!Number.isFinite(issuedAt)) {
+		return false;
+	}
+
+	let now = Date.now();
+	if (issuedAt > now || now - issuedAt > sessionMaxAgeSeconds * 1000) {
+		return false;
+	}
+
+	let expected = await signSessionToken(username, sessionSecret, issuedAt);
+	return timingSafeEqual(new TextEncoder().encode(token), new TextEncoder().encode(expected));
+}
+
+function getSafeNextPath(request: Request): string {
+	let url = new URL(request.url);
+	let next = url.searchParams.get('next') ?? '/';
+	try {
+		let nextUrl = new URL(next, url.origin);
+		if (nextUrl.origin !== url.origin || nextUrl.pathname === LOGIN_PATH) {
+			return '/';
+		}
+		return `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}` || '/';
+	} catch {
+		return '/';
+	}
+}
+
+function getCurrentPathWithSearch(request: Request): string {
+	let url = new URL(request.url);
+	return `${url.pathname}${url.search}${url.hash}` || '/';
+}
+
+function redirectResponse(location: string, status: 302 | 303 = 302, headers: HeadersInit = {}): Response {
+	return new Response(null, {
+		status,
+		headers: {
+			Location: location,
+			'Cache-Control': 'no-store',
+			...headers,
+		},
+	});
+}
+
+function applySecurityHeaders(response: Response, options: { contentSecurityPolicy?: boolean } = {}): Response {
+	response.headers.set('X-Content-Type-Options', 'nosniff');
+	response.headers.set('Referrer-Policy', 'no-referrer');
+	response.headers.set('X-Frame-Options', 'DENY');
+	if (options.contentSecurityPolicy) {
+		response.headers.set(
+			'Content-Security-Policy',
+			"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+		);
+	}
+	return response;
+}
+
+function isSameOriginFormPost(request: Request): boolean {
+	let requestUrl = new URL(request.url);
+	let origin = request.headers.get('Origin');
+	if (origin !== null) {
+		return origin === requestUrl.origin;
+	}
+
+	let referer = request.headers.get('Referer');
+	if (referer !== null) {
+		try {
+			return new URL(referer).origin === requestUrl.origin;
+		} catch {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+function shouldUseLoginPage(request: Request): boolean {
+	if (request.method !== 'GET' && request.method !== 'HEAD') {
+		return false;
+	}
+	let accept = request.headers.get('Accept') ?? '';
+	let userAgent = request.headers.get('User-Agent') ?? '';
+	return accept.includes('text/html') || userAgent.toLowerCase().includes('mozilla');
+}
+
+function getLoginClientId(request: Request): string {
+	return (
+		request.headers.get('CF-Connecting-IP') ??
+		request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ??
+		'unknown'
+	);
+}
+
+function isLoginRateLimited(request: Request): boolean {
+	let clientId = getLoginClientId(request);
+	let attempt = loginAttempts.get(clientId);
+	if (attempt === undefined) {
+		return false;
+	}
+	let now = Date.now();
+	if (attempt.lockedUntil > now) {
+		return true;
+	}
+	if (now - attempt.windowStartedAt > LOGIN_RATE_LIMIT_WINDOW_SECONDS * 1000) {
+		loginAttempts.delete(clientId);
+	}
+	return false;
+}
+
+function recordLoginFailure(request: Request): void {
+	let clientId = getLoginClientId(request);
+	let now = Date.now();
+	let attempt = loginAttempts.get(clientId);
+	if (attempt === undefined || now - attempt.windowStartedAt > LOGIN_RATE_LIMIT_WINDOW_SECONDS * 1000) {
+		attempt = { failures: 0, windowStartedAt: now, lockedUntil: 0 };
+	}
+	attempt.failures += 1;
+	if (attempt.failures >= LOGIN_RATE_LIMIT_MAX_FAILURES) {
+		attempt.lockedUntil = now + LOGIN_RATE_LIMIT_WINDOW_SECONDS * 1000;
+	}
+	loginAttempts.set(clientId, attempt);
+}
+
+function clearLoginFailures(request: Request): void {
+	loginAttempts.delete(getLoginClientId(request));
+}
+
+function renderLoginPage(nextPath: string, errorMessage: string | null = null, status: number | null = null): Response {
+	let error = errorMessage ? `<div class="error" role="alert">${escapeXml(errorMessage)}</div>` : '';
+	let page = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width,initial-scale=1.0">
+	<title>登录 R2 Storage</title>
+	<style>
+		:root { color-scheme: light dark; }
+		* { box-sizing: border-box; }
+		body {
+			min-height: 100vh;
+			margin: 0;
+			display: grid;
+			place-items: center;
+			background: linear-gradient(135deg, #0f172a, #1e3a8a 45%, #0f766e);
+			font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+			color: #0f172a;
+			padding: 24px;
+		}
+		.card {
+			width: min(100%, 420px);
+			padding: 32px;
+			border-radius: 24px;
+			background: rgba(255, 255, 255, 0.94);
+			box-shadow: 0 24px 70px rgba(15, 23, 42, 0.35);
+			backdrop-filter: blur(16px);
+		}
+		h1 { margin: 0 0 8px; font-size: 28px; }
+		p { margin: 0 0 24px; color: #64748b; line-height: 1.6; }
+		label { display: block; margin: 18px 0 8px; font-weight: 700; }
+		input {
+			width: 100%;
+			padding: 13px 14px;
+			border: 1px solid #cbd5e1;
+			border-radius: 12px;
+			font: inherit;
+			background: #fff;
+			color: #0f172a;
+			outline: none;
+		}
+		input:focus {
+			border-color: #2563eb;
+			box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.16);
+		}
+		button {
+			width: 100%;
+			margin-top: 24px;
+			border: 0;
+			border-radius: 12px;
+			padding: 14px 16px;
+			font: inherit;
+			font-weight: 800;
+			color: #fff;
+			background: linear-gradient(135deg, #2563eb, #0f766e);
+			cursor: pointer;
+		}
+		button:hover { filter: brightness(1.05); }
+		.error {
+			margin: 0 0 18px;
+			padding: 12px 14px;
+			border-radius: 12px;
+			background: #fee2e2;
+			color: #991b1b;
+			font-weight: 700;
+		}
+		.hint { margin-top: 18px; font-size: 13px; color: #64748b; text-align: center; }
+	</style>
+</head>
+<body>
+	<main class="card">
+		<h1>登录 R2 Storage</h1>
+		<p>请输入 WebDAV 用户名和密码，登录后会回到原访问路径。</p>
+		${error}
+		<form method="post" action="${LOGIN_PATH}?next=${encodeURIComponent(nextPath)}" autocomplete="on">
+			<label for="username">用户名</label>
+			<input id="username" name="username" type="text" autocomplete="username" required autofocus>
+			<label for="password">密码</label>
+			<input id="password" name="password" type="password" autocomplete="current-password" required>
+			<button type="submit">登录</button>
+		</form>
+		<div class="hint">WebDAV 客户端仍可继续使用 Basic Auth。</div>
+	</main>
+</body>
+</html>`;
+	return new Response(page, {
+		status: status ?? (errorMessage === null ? 200 : 401),
+		headers: {
+			'Content-Type': 'text/html; charset=utf-8',
+			'Cache-Control': 'no-store',
+		},
+	});
+}
+
+async function handleLoginRoute(
+	request: Request,
+	username: string,
+	password: string,
+	sessionSecret: string,
+	sessionMaxAgeSeconds: number,
+): Promise<Response> {
+	if (request.method === 'GET' || request.method === 'HEAD') {
+		return renderLoginPage(getSafeNextPath(request));
+	}
+
+	if (request.method !== 'POST') {
+		return new Response('Method Not Allowed', {
+			status: 405,
+			headers: { Allow: 'GET, HEAD, POST' },
+		});
+	}
+	if (!isSameOriginFormPost(request)) {
+		return new Response('Forbidden', { status: 403 });
+	}
+	if (isLoginRateLimited(request)) {
+		return renderLoginPage(getSafeNextPath(request), '登录失败次数过多，请稍后再试。', 429);
+	}
+
+	let nextPath = getSafeNextPath(request);
+	let form = await request.formData();
+	let submittedUsername = String(form.get('username') ?? '');
+	let submittedPassword = String(form.get('password') ?? '');
+
+	if (!isCredentialPairAuthorized(submittedUsername, submittedPassword, username, password)) {
+		recordLoginFailure(request);
+		return renderLoginPage(nextPath, '用户名或密码不正确，请重试。');
+	}
+	clearLoginFailures(request);
+
+	return redirectResponse(nextPath, 303, {
+		'Set-Cookie': await createSessionCookie(username, sessionSecret, sessionMaxAgeSeconds, request.url),
+	});
+}
+
+function handleLogoutRoute(request: Request): Response {
+	if (!isSameOriginFormPost(request)) {
+		return new Response('Forbidden', { status: 403 });
+	}
+	return redirectResponse(`${LOGIN_PATH}?next=/`, 303, {
+		'Set-Cookie': clearSessionCookie(request.url),
+	});
+}
+
+function getFormValue(form: FormData, name: string): string {
+	let value = form.get(name);
+	return typeof value === 'string' ? value : '';
+}
+
+function normalizeFormResourcePath(value: string): string {
+	return value.replace(/^\/+|\/+$/g, '');
+}
+
+function normalizeEntryName(value: string): string | null {
+	let name = value.trim();
+	if (
+		name === '' ||
+		name === '.' ||
+		name === '..' ||
+		name.includes('/') ||
+		name.includes('\\') ||
+		name.includes('\0')
+	) {
+		return null;
+	}
+	return name;
+}
+
+function joinResourcePath(parentPath: string, name: string): string {
+	return parentPath === '' ? name : `${parentPath}/${name}`;
+}
+
+function getRequestOrigin(request: Request): string {
+	return new URL(request.url).origin;
+}
+
+function getResourceUrl(request: Request, resourcePath: string, isCollection: boolean): string {
+	return new URL(getResourceHref(resourcePath, isCollection), getRequestOrigin(request)).toString();
+}
+
+function redirectToCollection(request: Request, resourcePath: string, params: Record<string, string>): Response {
+	let url = new URL(getResourceHref(resourcePath, true), getRequestOrigin(request));
+	for (const [name, value] of Object.entries(params)) {
+		url.searchParams.set(name, value);
+	}
+	return redirectResponse(`${url.pathname}${url.search}`, 303);
+}
+
+function badManagementRequest(request: Request, parentPath: string, message: string): Response {
+	return redirectToCollection(request, parentPath, { error: message });
+}
+
+async function handleMkdirAction(request: Request, bucket: R2Bucket): Promise<Response> {
+	let form = await request.formData();
+	let parentPath = normalizeFormResourcePath(getFormValue(form, 'parent'));
+	let name = normalizeEntryName(getFormValue(form, 'name'));
+	if (name === null) {
+		return badManagementRequest(request, parentPath, '文件夹名称无效');
+	}
+
+	let targetPath = joinResourcePath(parentPath, name);
+	if (isReservedResourcePath(targetPath)) {
+		return badManagementRequest(request, parentPath, '该名称为系统保留路径');
+	}
+	if (await bucket.head(targetPath)) {
+		return badManagementRequest(request, parentPath, '目标已存在');
+	}
+
+	let response = await handle_mkcol(
+		new Request(getResourceUrl(request, targetPath, true), {
+			method: 'MKCOL',
+			headers: request.headers,
+		}),
+		bucket,
+	);
+	if (!response.ok) {
+		return badManagementRequest(request, parentPath, `创建失败：${response.status}`);
+	}
+	return redirectToCollection(request, parentPath, { notice: '文件夹已创建' });
+}
+
+async function handleDeleteAction(request: Request, bucket: R2Bucket): Promise<Response> {
+	let form = await request.formData();
+	let targetPath = normalizeFormResourcePath(getFormValue(form, 'target'));
+	if (targetPath === '' || isReservedResourcePath(targetPath)) {
+		return badManagementRequest(request, getParentPath(targetPath), '删除目标无效');
+	}
+
+	let target = await bucket.head(targetPath);
+	if (target === null) {
+		return badManagementRequest(request, getParentPath(targetPath), '目标不存在');
+	}
+
+	let isCollection = target.customMetadata?.resourcetype === '<collection />';
+	let response = await handle_delete(
+		new Request(getResourceUrl(request, targetPath, isCollection), {
+			method: 'DELETE',
+			headers: request.headers,
+		}),
+		bucket,
+	);
+	if (!response.ok) {
+		return badManagementRequest(request, getParentPath(targetPath), `删除失败：${response.status}`);
+	}
+	return redirectToCollection(request, getParentPath(targetPath), { notice: '已删除' });
+}
+
+async function handleRenameAction(request: Request, bucket: R2Bucket): Promise<Response> {
+	let form = await request.formData();
+	let targetPath = normalizeFormResourcePath(getFormValue(form, 'target'));
+	let parentPath = getParentPath(targetPath);
+	let name = normalizeEntryName(getFormValue(form, 'name'));
+	if (targetPath === '' || name === null) {
+		return badManagementRequest(request, parentPath, '重命名目标无效');
+	}
+	if (isReservedResourcePath(targetPath)) {
+		return badManagementRequest(request, parentPath, '系统保留路径不能重命名');
+	}
+
+	let destinationPath = joinResourcePath(parentPath, name);
+	if (isReservedResourcePath(destinationPath)) {
+		return badManagementRequest(request, parentPath, '该名称为系统保留路径');
+	}
+	if (destinationPath === targetPath) {
+		return redirectToCollection(request, parentPath, { notice: '名称未变化' });
+	}
+	if (await bucket.head(destinationPath)) {
+		return badManagementRequest(request, parentPath, '目标名称已存在');
+	}
+
+	let target = await bucket.head(targetPath);
+	if (target === null) {
+		return badManagementRequest(request, parentPath, '目标不存在');
+	}
+
+	let isCollection = target.customMetadata?.resourcetype === '<collection />';
+	let headers = new Headers(request.headers);
+	headers.set('Destination', getResourceUrl(request, destinationPath, isCollection));
+	headers.set('Overwrite', 'F');
+	let response = await handle_move(
+		new Request(getResourceUrl(request, targetPath, isCollection), {
+			method: 'MOVE',
+			headers,
+		}),
+		bucket,
+	);
+	if (!response.ok) {
+		return badManagementRequest(request, parentPath, `重命名失败：${response.status}`);
+	}
+	return redirectToCollection(request, parentPath, { notice: '已重命名' });
+}
+
+async function handleActionRoute(request: Request, bucket: R2Bucket): Promise<Response> {
+	if (request.method !== 'POST') {
+		return new Response('Method Not Allowed', {
+			status: 405,
+			headers: { Allow: 'POST' },
+		});
+	}
+	if (!isSameOriginFormPost(request)) {
+		return new Response('Forbidden', { status: 403 });
+	}
+
+	let pathname = new URL(request.url).pathname;
+	switch (pathname) {
+		case MKDIR_ACTION_PATH:
+			return await handleMkdirAction(request, bucket);
+		case DELETE_ACTION_PATH:
+			return await handleDeleteAction(request, bucket);
+		case RENAME_ACTION_PATH:
+			return await handleRenameAction(request, bucket);
+		default:
+			return new Response('Not Found', { status: 404 });
+	}
+}
+
 function extractLockOwner(body: string): string | undefined {
 	let owner = body.match(/<owner(?:\s[^>]*)?>([\s\S]*?)<\/owner>/i)?.[1];
 	if (owner === undefined) {
@@ -702,6 +1260,166 @@ async function findMatchingLock(
 	return null;
 }
 
+function renderDirectoryMessage(request: Request): string {
+	let url = new URL(request.url);
+	let notice = url.searchParams.get('notice');
+	let error = url.searchParams.get('error');
+	if (error !== null) {
+		return `<div class="message error" role="alert">${escapeXml(error)}</div>`;
+	}
+	if (notice !== null) {
+		return `<div class="message notice" role="status">${escapeXml(notice)}</div>`;
+	}
+	return '';
+}
+
+function getResourceBasename(resourcePath: string): string {
+	return resourcePath.split('/').pop() ?? resourcePath;
+}
+
+function renderDirectoryEntry(object: R2Object, prefix: string): string {
+	let isCollection = object.customMetadata?.resourcetype === '<collection />';
+	let href = getResourceHref(object.key, isCollection);
+	let displayName = object.httpMetadata?.contentDisposition ?? object.key.slice(prefix.length);
+	let defaultRenameValue = getResourceBasename(object.key);
+	let disabled = isReservedResourcePath(object.key) ? ' disabled title="系统保留路径不能在 Web 界面管理"' : '';
+
+	return `<div class="entry">
+	<a class="entry-link" href="${escapeXml(href)}">${escapeXml(displayName)}</a>
+	<div class="entry-actions">
+		<form method="post" action="${RENAME_ACTION_PATH}" class="rename-form">
+			<input type="hidden" name="target" value="${escapeXml(object.key)}">
+			<input name="name" value="${escapeXml(defaultRenameValue)}" aria-label="新名称">
+			<button type="submit"${disabled}>重命名</button>
+		</form>
+		<form method="post" action="${DELETE_ACTION_PATH}">
+			<input type="hidden" name="target" value="${escapeXml(object.key)}">
+			<button class="danger" type="submit"${disabled}>删除</button>
+		</form>
+	</div>
+</div>`;
+}
+
+function renderDirectoryPage(request: Request, resourcePath: string, entries: string): string {
+	let parentLink = resourcePath === '' ? '' : `<a class="parent-link" href="../">..</a>`;
+	return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width,initial-scale=1.0">
+	<title>R2 Storage</title>
+	<style>
+		* { box-sizing: border-box; }
+		body {
+			margin: 0;
+			padding: 24px;
+			background: #f8fafc;
+			color: #0f172a;
+			font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+		}
+		header, .toolbar, .entry, .entry-actions, form {
+			display: flex;
+			align-items: center;
+			gap: 10px;
+		}
+		header {
+			justify-content: space-between;
+			margin-bottom: 18px;
+		}
+		h1 { margin: 0; font-size: 28px; }
+		.toolbar {
+			flex-wrap: wrap;
+			margin-bottom: 16px;
+			padding: 14px;
+			border: 1px solid #e2e8f0;
+			border-radius: 14px;
+			background: #fff;
+		}
+		input {
+			min-width: 160px;
+			border: 1px solid #cbd5e1;
+			border-radius: 8px;
+			padding: 8px 10px;
+			font: inherit;
+		}
+		button {
+			border: 0;
+			border-radius: 8px;
+			background: #2563eb;
+			color: #fff;
+			padding: 8px 12px;
+			cursor: pointer;
+			font: inherit;
+			white-space: nowrap;
+		}
+		button:hover { filter: brightness(1.05); }
+		button:disabled { cursor: not-allowed; opacity: .45; }
+		button.danger { background: #dc2626; }
+		button.secondary { background: #e2e8f0; color: #0f172a; }
+		.message {
+			margin-bottom: 16px;
+			padding: 12px 14px;
+			border-radius: 12px;
+			font-weight: 700;
+		}
+		.notice { background: #dcfce7; color: #166534; }
+		.error { background: #fee2e2; color: #991b1b; }
+		.parent-link, .entry {
+			width: 100%;
+			margin-bottom: 8px;
+			border-radius: 12px;
+			background: #fff;
+			color: #0f172a;
+			text-decoration: none;
+			box-shadow: 0 1px 3px rgba(15, 23, 42, .08);
+		}
+		.parent-link {
+			display: block;
+			padding: 12px 14px;
+			background: #e2e8f0;
+		}
+		.entry {
+			justify-content: space-between;
+			padding: 10px;
+		}
+		.entry-link {
+			flex: 1;
+			min-width: 180px;
+			color: #0f172a;
+			text-decoration: none;
+			padding: 8px 10px;
+			border-radius: 8px;
+			overflow-wrap: anywhere;
+		}
+		.entry-link:hover { background: #ecfdf5; color: #047857; }
+		.entry-actions { flex-wrap: wrap; justify-content: flex-end; }
+		.rename-form input { width: 180px; }
+		@media (max-width: 760px) {
+			body { padding: 14px; }
+			header, .entry { align-items: stretch; flex-direction: column; }
+			.entry-actions, form { width: 100%; }
+			input, button, .rename-form input { width: 100%; }
+		}
+	</style>
+</head>
+<body>
+	<header>
+		<h1>R2 Storage</h1>
+		<form method="post" action="${LOGOUT_PATH}"><button class="secondary" type="submit">退出登录</button></form>
+	</header>
+	${renderDirectoryMessage(request)}
+	<section class="toolbar" aria-label="文件管理">
+		<form method="post" action="${MKDIR_ACTION_PATH}">
+			<input type="hidden" name="parent" value="${escapeXml(resourcePath)}">
+			<input name="name" placeholder="新文件夹名称" aria-label="新文件夹名称" required>
+			<button type="submit">创建文件夹</button>
+		</form>
+	</section>
+	<nav>${parentLink}${entries || '<p>当前目录为空。</p>'}</nav>
+</body>
+</html>`;
+}
+
 async function handle_head(request: Request, bucket: R2Bucket): Promise<Response> {
 	let response = await handle_get(request, bucket);
 	return new Response(null, {
@@ -723,23 +1441,15 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 		}
 
 		let page = '',
-			prefix = resource_path;
-		if (resource_path !== '') {
-			page += `<a href="../">..</a><br>`;
-			prefix = `${resource_path}/`;
-		}
+			prefix = resource_path === '' ? '' : `${resource_path}/`;
 
 		for await (const object of listAll(bucket, prefix)) {
 			if (object.key === resource_path) {
 				continue;
 			}
-			let href = getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />');
-			page += `<a href="${escapeXml(href)}">${escapeXml(
-				object.httpMetadata?.contentDisposition ?? object.key.slice(prefix.length),
-			)}</a><br>`;
+			page += renderDirectoryEntry(object, prefix);
 		}
-		// 定义模板
-		var pageSource = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>R2Storage</title><style>*{box-sizing:border-box;}body{padding:10px;font-family:'Segoe UI','Circular','Roboto','Lato','Helvetica Neue','Arial Rounded MT Bold','sans-serif';}a{display:inline-block;width:100%;color:#000;text-decoration:none;padding:5px 10px;cursor:pointer;border-radius:5px;}a:hover{background-color:#60C590;color:white;}a[href="../"]{background-color:#cbd5e1;}</style></head><body><h1>R2 Storage</h1><div>${page}</div></body></html>`;
+		let pageSource = renderDirectoryPage(request, resource_path, page);
 
 		return new Response(pageSource, {
 			status: 200,
@@ -1595,20 +2305,57 @@ function is_authorized(authorization_header: string, username: string, password:
 	return timingSafeEqual(header, expected);
 }
 
+async function isRequestAuthorized(
+	request: Request,
+	username: string,
+	password: string,
+	sessionSecret: string,
+	sessionMaxAgeSeconds: number,
+): Promise<boolean> {
+	return (
+		is_authorized(request.headers.get('Authorization') ?? '', username, password) ||
+		(await isValidSessionCookie(request.headers.get('Cookie'), username, sessionSecret, sessionMaxAgeSeconds))
+	);
+}
+
+function unauthorizedResponse(request: Request): Response {
+	if (shouldUseLoginPage(request)) {
+		return redirectResponse(`${LOGIN_PATH}?next=${encodeURIComponent(getCurrentPathWithSearch(request))}`);
+	}
+	return new Response('Unauthorized', {
+		status: 401,
+		headers: {
+			'WWW-Authenticate': 'Basic realm="webdav"',
+		},
+	});
+}
+
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const { bucket } = env;
+		const sessionSecret = getSessionSecret(env);
+		const sessionMaxAgeSeconds = getSessionMaxAgeSeconds(env);
+		const { pathname } = new URL(request.url);
+
+		if (pathname === LOGIN_PATH) {
+			return applySecurityHeaders(
+				await handleLoginRoute(request, env.USERNAME, env.PASSWORD, sessionSecret, sessionMaxAgeSeconds),
+				{ contentSecurityPolicy: true },
+			);
+		}
+		if (pathname === LOGOUT_PATH) {
+			return applySecurityHeaders(handleLogoutRoute(request), { contentSecurityPolicy: true });
+		}
 
 		if (
 			request.method !== 'OPTIONS' &&
-			!is_authorized(request.headers.get('Authorization') ?? '', env.USERNAME, env.PASSWORD)
+			!(await isRequestAuthorized(request, env.USERNAME, env.PASSWORD, sessionSecret, sessionMaxAgeSeconds))
 		) {
-			return new Response('Unauthorized', {
-				status: 401,
-				headers: {
-					'WWW-Authenticate': 'Basic realm="webdav"',
-				},
-			});
+			return applySecurityHeaders(unauthorizedResponse(request));
+		}
+
+		if (pathname.startsWith(`${ACTION_PREFIX}/`)) {
+			return applySecurityHeaders(await handleActionRoute(request, bucket), { contentSecurityPolicy: true });
 		}
 
 		let response: Response = await dispatch_handler(request, bucket);
@@ -1647,6 +2394,8 @@ export default {
 		response.headers.set('Access-Control-Allow-Credentials', 'false');
 		response.headers.set('Access-Control-Max-Age', '86400');
 
-		return response;
+		return applySecurityHeaders(response, {
+			contentSecurityPolicy: request.method === 'GET' && new URL(request.url).pathname.endsWith('/'),
+		});
 	},
 };
