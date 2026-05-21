@@ -731,6 +731,7 @@ function redirectResponse(location: string, status: 302 | 303 = 302, headers: He
 		headers: {
 			Location: location,
 			'Cache-Control': 'no-store',
+			'Content-Type': 'text/html; charset=utf-8',
 			...headers,
 		},
 	});
@@ -1401,13 +1402,13 @@ function renderDirectoryEntry(object: R2Object, prefix: string, csrfToken: strin
 		</span>
 	</a>
 	<div class="entry-actions">
-		<form method="post" action="${RENAME_ACTION_PATH}" class="rename-form">
+		<form method="post" action="${RENAME_ACTION_PATH}" class="rename-form management-form">
 			${csrfInput}
 			<input type="hidden" name="target" value="${escapeXml(object.key)}">
 			<input type="hidden" name="name" value="${escapeXml(defaultRenameValue)}">
 			<button type="button" class="rename-button" data-current-name="${escapeXml(defaultRenameValue)}"${disabled}>重命名</button>
 		</form>
-		<form method="post" action="${DELETE_ACTION_PATH}">
+		<form method="post" action="${DELETE_ACTION_PATH}" class="management-form">
 			${csrfInput}
 			<input type="hidden" name="target" value="${escapeXml(object.key)}">
 			<button class="danger" type="submit"${disabled}>删除</button>
@@ -1644,7 +1645,56 @@ function renderDirectoryPage(
 		}
 	</style>
 	<script>
+		async function submitManagementForm(form) {
+			const submitButton = form.querySelector('button');
+			if (submitButton !== null) {
+				submitButton.disabled = true;
+			}
+			try {
+				const response = await fetch(form.action, {
+					method: 'POST',
+					body: new FormData(form),
+					credentials: 'same-origin',
+				});
+				if (response.redirected && response.url) {
+					window.location.assign(response.url);
+					return;
+				}
+				if (response.ok) {
+					window.location.reload();
+					return;
+				}
+				window.alert('操作失败：' + response.status);
+			} catch {
+				window.alert('操作失败，请检查网络后重试。');
+			} finally {
+				if (submitButton !== null) {
+					submitButton.disabled = false;
+				}
+			}
+		}
+
 		document.addEventListener('click', (event) => {
+			const mkdirButton = event.target.closest('.mkdir-button');
+			if (mkdirButton !== null && !mkdirButton.disabled) {
+				const form = mkdirButton.closest('form');
+				if (form === null) {
+					return;
+				}
+				const nextName = window.prompt('请输入新文件夹名称', '新文件夹');
+				if (nextName === null) {
+					return;
+				}
+				const trimmedName = nextName.trim();
+				if (trimmedName === '') {
+					window.alert('文件夹名称不能为空');
+					return;
+				}
+				form.elements.namedItem('name').value = trimmedName;
+				form.requestSubmit();
+				return;
+			}
+
 			const button = event.target.closest('.rename-button');
 			if (button === null || button.disabled) {
 				return;
@@ -1666,6 +1716,15 @@ function renderDirectoryPage(
 			form.elements.namedItem('name').value = trimmedName;
 			form.requestSubmit();
 		});
+
+		document.addEventListener('submit', (event) => {
+			const form = event.target;
+			if (!(form instanceof HTMLFormElement) || !form.classList.contains('management-form')) {
+				return;
+			}
+			event.preventDefault();
+			submitManagementForm(form);
+		});
 	</script>
 </head>
 <body>
@@ -1681,11 +1740,11 @@ function renderDirectoryPage(
 	${renderDirectoryMessage(request)}
 	<section class="toolbar" aria-label="文件管理">
 		<div class="toolbar-title">新建文件夹</div>
-		<form method="post" action="${MKDIR_ACTION_PATH}">
+		<form method="post" action="${MKDIR_ACTION_PATH}" class="management-form">
 			${csrfInput}
 			<input type="hidden" name="parent" value="${escapeXml(resourcePath)}">
-			<input name="name" placeholder="新文件夹名称" aria-label="新文件夹名称" required>
-			<button type="submit">创建文件夹</button>
+			<input type="hidden" name="name" value="">
+			<button type="button" class="mkdir-button">创建文件夹</button>
 		</form>
 	</section>
 	<nav>${parentLink}${entries || '<p class="empty-state">当前目录为空，可以先创建一个文件夹。</p>'}</nav>
