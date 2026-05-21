@@ -70,6 +70,7 @@
 ## Interaction states
 
 - Loading: native browser form navigation.
+- Name entry: create-folder and rename use an in-page modal dialog rather than browser-native prompts.
 - Empty: show a quiet empty directory message.
 - Error: red banner with concise copy.
 - Success: green banner with concise copy.
@@ -92,5 +93,4 @@
 
 ## Open questions
 
-- [ ] Whether to replace `window.prompt` rename with a custom accessible modal later / owner: product / impact: medium UX polish.
 - [ ] Whether to add upload/download browser actions / owner: product / impact: scope expansion.

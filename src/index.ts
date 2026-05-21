@@ -1636,6 +1636,53 @@ function renderDirectoryPage(
 			color: var(--muted);
 			font-weight: 800;
 		}
+		.name-dialog {
+			width: min(460px, calc(100% - 28px));
+			border: 0;
+			padding: 0;
+			border-radius: 24px;
+			background: transparent;
+			color: var(--text);
+		}
+		.name-dialog::backdrop {
+			background: rgba(15, 23, 42, .48);
+			backdrop-filter: blur(4px);
+		}
+		.name-dialog-card {
+			display: grid;
+			gap: 16px;
+			padding: 24px;
+			border: 1px solid rgba(219, 229, 241, .9);
+			border-radius: 24px;
+			background: #fff;
+			box-shadow: 0 30px 90px rgba(2, 6, 23, .32);
+		}
+		.name-dialog h2 {
+			margin: 0;
+			font-size: 22px;
+			letter-spacing: -0.025em;
+		}
+		.name-dialog label {
+			display: grid;
+			gap: 8px;
+			font-weight: 850;
+			color: #334155;
+		}
+		.name-dialog input {
+			width: 100%;
+		}
+		.name-dialog-error {
+			margin: -4px 0 0;
+			color: var(--danger);
+			font-size: 13px;
+			font-weight: 800;
+		}
+		.name-dialog-error[hidden] { display: none; }
+		.dialog-actions {
+			display: flex;
+			justify-content: flex-end;
+			gap: 10px;
+		}
 		@media (max-width: 760px) {
 			body { padding: 14px; }
 			header, .entry, .toolbar { align-items: stretch; flex-direction: column; }
@@ -1645,6 +1692,62 @@ function renderDirectoryPage(
 		}
 	</style>
 	<script>
+		let pendingNameForm = null;
+		let pendingEmptyMessage = '';
+
+		function getNameDialogElements() {
+			return {
+				dialog: document.getElementById('name-dialog'),
+				form: document.getElementById('name-dialog-form'),
+				title: document.getElementById('name-dialog-title'),
+				input: document.getElementById('name-dialog-input'),
+				error: document.getElementById('name-dialog-error'),
+				confirm: document.getElementById('name-dialog-confirm'),
+			};
+		}
+
+		function openNameDialog(options) {
+			const elements = getNameDialogElements();
+			pendingNameForm = options.form;
+			pendingEmptyMessage = options.emptyMessage;
+			elements.title.textContent = options.title;
+			elements.input.value = options.defaultName;
+			elements.error.hidden = true;
+			elements.error.textContent = '';
+			elements.confirm.textContent = options.confirmLabel;
+			elements.dialog.showModal();
+			requestAnimationFrame(() => {
+				elements.input.focus();
+				elements.input.select();
+			});
+		}
+
+		function closeNameDialog() {
+			const { dialog } = getNameDialogElements();
+			dialog.close();
+			pendingNameForm = null;
+			pendingEmptyMessage = '';
+		}
+
+		function confirmNameDialog() {
+			const { input, error } = getNameDialogElements();
+			const trimmedName = input.value.trim();
+			if (trimmedName === '') {
+				error.textContent = pendingEmptyMessage;
+				error.hidden = false;
+				input.focus();
+				return;
+			}
+			if (pendingNameForm === null) {
+				closeNameDialog();
+				return;
+			}
+			pendingNameForm.elements.namedItem('name').value = trimmedName;
+			const form = pendingNameForm;
+			closeNameDialog();
+			form.requestSubmit();
+		}
+
 		async function submitManagementForm(form) {
 			const submitButton = form.querySelector('button');
 			if (submitButton !== null) {
@@ -1675,27 +1778,39 @@ function renderDirectoryPage(
 		}
 
 		document.addEventListener('click', (event) => {
-			const mkdirButton = event.target.closest('.mkdir-button');
+			const target = event.target;
+			if (!(target instanceof Element)) {
+				return;
+			}
+
+			if (target.matches('[data-dialog-cancel]')) {
+				closeNameDialog();
+				return;
+			}
+
+			const dialog = document.getElementById('name-dialog');
+			if (target === dialog) {
+				closeNameDialog();
+				return;
+			}
+
+			const mkdirButton = target.closest('.mkdir-button');
 			if (mkdirButton !== null && !mkdirButton.disabled) {
 				const form = mkdirButton.closest('form');
 				if (form === null) {
 					return;
 				}
-				const nextName = window.prompt('请输入新文件夹名称', '新文件夹');
-				if (nextName === null) {
-					return;
-				}
-				const trimmedName = nextName.trim();
-				if (trimmedName === '') {
-					window.alert('文件夹名称不能为空');
-					return;
-				}
-				form.elements.namedItem('name').value = trimmedName;
-				form.requestSubmit();
+				openNameDialog({
+					form,
+					title: '创建文件夹',
+					defaultName: '新文件夹',
+					confirmLabel: '创建',
+					emptyMessage: '文件夹名称不能为空',
+				});
 				return;
 			}
 
-			const button = event.target.closest('.rename-button');
+			const button = target.closest('.rename-button');
 			if (button === null || button.disabled) {
 				return;
 			}
@@ -1703,22 +1818,22 @@ function renderDirectoryPage(
 			if (form === null) {
 				return;
 			}
-			const currentName = button.dataset.currentName || '';
-			const nextName = window.prompt('请输入新名称', currentName);
-			if (nextName === null) {
-				return;
-			}
-			const trimmedName = nextName.trim();
-			if (trimmedName === '') {
-				window.alert('新名称不能为空');
-				return;
-			}
-			form.elements.namedItem('name').value = trimmedName;
-			form.requestSubmit();
+			openNameDialog({
+				form,
+				title: '重命名',
+				defaultName: button.dataset.currentName || '',
+				confirmLabel: '保存',
+				emptyMessage: '新名称不能为空',
+			});
 		});
 
 		document.addEventListener('submit', (event) => {
 			const form = event.target;
+			if (form.id === 'name-dialog-form') {
+				event.preventDefault();
+				confirmNameDialog();
+				return;
+			}
 			if (!(form instanceof HTMLFormElement) || !form.classList.contains('management-form')) {
 				return;
 			}
@@ -1748,6 +1863,20 @@ function renderDirectoryPage(
 		</form>
 	</section>
 	<nav>${parentLink}${entries || '<p class="empty-state">当前目录为空，可以先创建一个文件夹。</p>'}</nav>
+	<dialog id="name-dialog" class="name-dialog" aria-labelledby="name-dialog-title">
+		<form id="name-dialog-form" class="name-dialog-card" method="dialog">
+			<h2 id="name-dialog-title">输入名称</h2>
+			<label for="name-dialog-input">
+				名称
+				<input id="name-dialog-input" name="dialogName" autocomplete="off">
+			</label>
+			<p id="name-dialog-error" class="name-dialog-error" role="alert" hidden></p>
+			<div class="dialog-actions">
+				<button type="button" class="secondary" data-dialog-cancel>取消</button>
+				<button type="submit" id="name-dialog-confirm">确认</button>
+			</div>
+		</form>
+	</dialog>
 	</main>
 </body>
 </html>`;
