@@ -736,14 +736,18 @@ function redirectResponse(location: string, status: 302 | 303 = 302, headers: He
 	});
 }
 
-function applySecurityHeaders(response: Response, options: { contentSecurityPolicy?: boolean } = {}): Response {
+function applySecurityHeaders(
+	response: Response,
+	options: { contentSecurityPolicy?: boolean; inlineScript?: boolean } = {},
+): Response {
 	response.headers.set('X-Content-Type-Options', 'nosniff');
 	response.headers.set('Referrer-Policy', 'no-referrer');
 	response.headers.set('X-Frame-Options', 'DENY');
 	if (options.contentSecurityPolicy) {
+		let scriptPolicy = options.inlineScript ? " script-src 'unsafe-inline';" : '';
 		response.headers.set(
 			'Content-Security-Policy',
-			"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+			`default-src 'none'; style-src 'unsafe-inline';${scriptPolicy} form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
 		);
 	}
 	return response;
@@ -845,49 +849,80 @@ function renderLoginPage(
 			margin: 0;
 			display: grid;
 			place-items: center;
-			background: linear-gradient(135deg, #0f172a, #1e3a8a 45%, #0f766e);
+			background:
+				radial-gradient(circle at 20% 20%, rgba(56, 189, 248, .22), transparent 30%),
+				radial-gradient(circle at 80% 0%, rgba(45, 212, 191, .22), transparent 34%),
+				linear-gradient(135deg, #020617, #172554 48%, #0f766e);
 			font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
 			color: #0f172a;
 			padding: 24px;
 		}
 		.card {
-			width: min(100%, 420px);
-			padding: 32px;
-			border-radius: 24px;
-			background: rgba(255, 255, 255, 0.94);
-			box-shadow: 0 24px 70px rgba(15, 23, 42, 0.35);
-			backdrop-filter: blur(16px);
+			width: min(100%, 440px);
+			padding: 34px;
+			border: 1px solid rgba(255, 255, 255, .55);
+			border-radius: 28px;
+			background: rgba(255, 255, 255, .94);
+			box-shadow: 0 30px 90px rgba(2, 6, 23, .42);
+			backdrop-filter: blur(18px);
 		}
-		h1 { margin: 0 0 8px; font-size: 28px; }
-		p { margin: 0 0 24px; color: #64748b; line-height: 1.6; }
-		label { display: block; margin: 18px 0 8px; font-weight: 700; }
+		.brand {
+			display: inline-flex;
+			align-items: center;
+			gap: 8px;
+			margin-bottom: 22px;
+			padding: 8px 12px;
+			border-radius: 999px;
+			background: #eff6ff;
+			color: #1d4ed8;
+			font-size: 13px;
+			font-weight: 800;
+		}
+		.brand-mark {
+			display: grid;
+			place-items: center;
+			width: 22px;
+			height: 22px;
+			border-radius: 8px;
+			background: linear-gradient(135deg, #2563eb, #0f766e);
+			color: #fff;
+			font-size: 13px;
+		}
+		h1 { margin: 0 0 10px; font-size: 30px; letter-spacing: -0.03em; }
+		p { margin: 0 0 26px; color: #64748b; line-height: 1.65; }
+		label { display: block; margin: 18px 0 8px; font-weight: 800; color: #334155; }
 		input {
 			width: 100%;
-			padding: 13px 14px;
-			border: 1px solid #cbd5e1;
-			border-radius: 12px;
+			padding: 14px 15px;
+			border: 1px solid #dbe3ef;
+			border-radius: 14px;
 			font: inherit;
-			background: #fff;
+			background: #f8fafc;
 			color: #0f172a;
 			outline: none;
+			transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
 		}
 		input:focus {
 			border-color: #2563eb;
+			background: #fff;
 			box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.16);
 		}
 		button {
 			width: 100%;
-			margin-top: 24px;
+			margin-top: 26px;
 			border: 0;
-			border-radius: 12px;
-			padding: 14px 16px;
+			border-radius: 14px;
+			padding: 15px 16px;
 			font: inherit;
 			font-weight: 800;
 			color: #fff;
 			background: linear-gradient(135deg, #2563eb, #0f766e);
 			cursor: pointer;
+			box-shadow: 0 14px 30px rgba(37, 99, 235, .24);
+			transition: transform .16s ease, filter .16s ease, box-shadow .16s ease;
 		}
-		button:hover { filter: brightness(1.05); }
+		button:hover { filter: brightness(1.05); transform: translateY(-1px); box-shadow: 0 18px 36px rgba(37, 99, 235, .3); }
+		button:focus-visible { outline: 3px solid rgba(37, 99, 235, .26); outline-offset: 3px; }
 		.error {
 			margin: 0 0 18px;
 			padding: 12px 14px;
@@ -910,6 +945,7 @@ function renderLoginPage(
 </head>
 <body>
 	<main class="card">
+		<div class="brand"><span class="brand-mark">R2</span><span>Secure WebDAV</span></div>
 		<h1>登录 R2 Storage</h1>
 		<p>请输入 WebDAV 用户名和密码，登录后会回到原访问路径。</p>
 		${error}
@@ -1344,6 +1380,10 @@ function renderCsrfInput(csrfToken: string | null): string {
 	return csrfToken === null ? '' : `<input type="hidden" name="csrf" value="${escapeXml(csrfToken)}">`;
 }
 
+function getEntryIcon(isCollection: boolean): string {
+	return isCollection ? '📁' : '📄';
+}
+
 function renderDirectoryEntry(object: R2Object, prefix: string, csrfToken: string | null): string {
 	let isCollection = object.customMetadata?.resourcetype === '<collection />';
 	let href = getResourceHref(object.key, isCollection);
@@ -1353,13 +1393,19 @@ function renderDirectoryEntry(object: R2Object, prefix: string, csrfToken: strin
 	let csrfInput = renderCsrfInput(csrfToken);
 
 	return `<div class="entry">
-	<a class="entry-link" href="${escapeXml(href)}">${escapeXml(displayName)}</a>
+	<a class="entry-link" href="${escapeXml(href)}">
+		<span class="entry-icon" aria-hidden="true">${getEntryIcon(isCollection)}</span>
+		<span class="entry-main">
+			<span class="entry-name">${escapeXml(displayName)}</span>
+			<span class="entry-meta">${isCollection ? '文件夹' : '对象'}</span>
+		</span>
+	</a>
 	<div class="entry-actions">
 		<form method="post" action="${RENAME_ACTION_PATH}" class="rename-form">
 			${csrfInput}
 			<input type="hidden" name="target" value="${escapeXml(object.key)}">
-			<input name="name" value="${escapeXml(defaultRenameValue)}" aria-label="新名称">
-			<button type="submit"${disabled}>重命名</button>
+			<input type="hidden" name="name" value="${escapeXml(defaultRenameValue)}">
+			<button type="button" class="rename-button" data-current-name="${escapeXml(defaultRenameValue)}"${disabled}>重命名</button>
 		</form>
 		<form method="post" action="${DELETE_ACTION_PATH}">
 			${csrfInput}
@@ -1376,8 +1422,9 @@ function renderDirectoryPage(
 	entries: string,
 	csrfToken: string | null,
 ): string {
-	let parentLink = resourcePath === '' ? '' : `<a class="parent-link" href="../">..</a>`;
+	let parentLink = resourcePath === '' ? '' : `<a class="parent-link" href="../">↑ 返回上一级</a>`;
 	let csrfInput = renderCsrfInput(csrfToken);
+	let currentPath = resourcePath === '' ? '/' : `/${resourcePath}/`;
 	return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1385,15 +1432,37 @@ function renderDirectoryPage(
 	<meta name="viewport" content="width=device-width,initial-scale=1.0">
 	<title>R2 Storage</title>
 	<style>
+		:root {
+			color-scheme: light;
+			--bg: #eef5ff;
+			--panel: rgba(255, 255, 255, .9);
+			--panel-solid: #ffffff;
+			--text: #0f172a;
+			--muted: #64748b;
+			--border: #dbe5f1;
+			--primary: #2563eb;
+			--primary-dark: #1d4ed8;
+			--teal: #0f766e;
+			--danger: #dc2626;
+			--shadow: 0 18px 55px rgba(15, 23, 42, .12);
+		}
 		* { box-sizing: border-box; }
 		body {
+			min-height: 100vh;
 			margin: 0;
-			padding: 24px;
-			background: #f8fafc;
-			color: #0f172a;
+			padding: 28px;
+			background:
+				radial-gradient(circle at top left, rgba(37, 99, 235, .18), transparent 34%),
+				radial-gradient(circle at 85% 0%, rgba(20, 184, 166, .18), transparent 30%),
+				linear-gradient(180deg, #f8fbff 0%, var(--bg) 100%);
+			color: var(--text);
 			font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
 		}
-		header, .toolbar, .entry, .entry-actions, form {
+		.app-shell {
+			width: min(1180px, 100%);
+			margin: 0 auto;
+		}
+		header, .toolbar, .entry, .entry-actions, form, .hero-title, .entry-link {
 			display: flex;
 			align-items: center;
 			gap: 10px;
@@ -1401,90 +1470,217 @@ function renderDirectoryPage(
 		header {
 			justify-content: space-between;
 			margin-bottom: 18px;
+			padding: 22px;
+			border: 1px solid rgba(219, 229, 241, .86);
+			border-radius: 26px;
+			background: var(--panel);
+			box-shadow: var(--shadow);
+			backdrop-filter: blur(14px);
 		}
-		h1 { margin: 0; font-size: 28px; }
+		.hero { min-width: 0; }
+		.brand-badge {
+			display: inline-flex;
+			align-items: center;
+			gap: 8px;
+			margin-bottom: 10px;
+			padding: 7px 11px;
+			border-radius: 999px;
+			background: #eff6ff;
+			color: var(--primary-dark);
+			font-size: 12px;
+			font-weight: 800;
+			letter-spacing: .02em;
+		}
+		.brand-dot {
+			width: 9px;
+			height: 9px;
+			border-radius: 999px;
+			background: linear-gradient(135deg, var(--primary), var(--teal));
+			box-shadow: 0 0 0 5px rgba(37, 99, 235, .12);
+		}
+		h1 {
+			margin: 0;
+			font-size: clamp(28px, 4vw, 42px);
+			letter-spacing: -0.045em;
+		}
+		.path-pill {
+			display: inline-flex;
+			max-width: 100%;
+			margin-top: 10px;
+			padding: 8px 11px;
+			border: 1px solid var(--border);
+			border-radius: 999px;
+			background: #f8fafc;
+			color: var(--muted);
+			font-size: 13px;
+			overflow-wrap: anywhere;
+		}
 		.toolbar {
+			justify-content: space-between;
 			flex-wrap: wrap;
-			margin-bottom: 16px;
-			padding: 14px;
-			border: 1px solid #e2e8f0;
-			border-radius: 14px;
-			background: #fff;
+			margin-bottom: 18px;
+			padding: 16px;
+			border: 1px solid var(--border);
+			border-radius: 22px;
+			background: var(--panel-solid);
+			box-shadow: 0 10px 30px rgba(15, 23, 42, .07);
+		}
+		.toolbar-title {
+			font-weight: 900;
+			color: #334155;
 		}
 		input {
-			min-width: 160px;
-			border: 1px solid #cbd5e1;
-			border-radius: 8px;
-			padding: 8px 10px;
+			min-width: 210px;
+			border: 1px solid var(--border);
+			border-radius: 12px;
+			padding: 10px 12px;
 			font: inherit;
+			background: #f8fafc;
+			color: var(--text);
+			outline: none;
+			transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
+		}
+		input:focus {
+			border-color: var(--primary);
+			background: #fff;
+			box-shadow: 0 0 0 4px rgba(37, 99, 235, .14);
 		}
 		button {
 			border: 0;
-			border-radius: 8px;
-			background: #2563eb;
+			border-radius: 12px;
+			background: linear-gradient(135deg, var(--primary), var(--teal));
 			color: #fff;
-			padding: 8px 12px;
+			padding: 10px 14px;
 			cursor: pointer;
 			font: inherit;
+			font-weight: 800;
 			white-space: nowrap;
+			box-shadow: 0 10px 22px rgba(37, 99, 235, .18);
+			transition: transform .16s ease, filter .16s ease, box-shadow .16s ease;
 		}
-		button:hover { filter: brightness(1.05); }
-		button:disabled { cursor: not-allowed; opacity: .45; }
-		button.danger { background: #dc2626; }
-		button.secondary { background: #e2e8f0; color: #0f172a; }
+		button:hover { filter: brightness(1.04); transform: translateY(-1px); }
+		button:focus-visible, a:focus-visible { outline: 3px solid rgba(37, 99, 235, .25); outline-offset: 3px; }
+		button:disabled { cursor: not-allowed; opacity: .45; transform: none; }
+		button.danger { background: linear-gradient(135deg, #ef4444, var(--danger)); box-shadow: 0 10px 22px rgba(220, 38, 38, .16); }
+		button.secondary { background: #e2e8f0; color: var(--text); box-shadow: none; }
 		.message {
 			margin-bottom: 16px;
-			padding: 12px 14px;
-			border-radius: 12px;
-			font-weight: 700;
+			padding: 13px 15px;
+			border-radius: 16px;
+			font-weight: 800;
+			box-shadow: 0 8px 22px rgba(15, 23, 42, .06);
 		}
 		.notice { background: #dcfce7; color: #166534; }
 		.error { background: #fee2e2; color: #991b1b; }
+		nav {
+			padding: 10px;
+			border: 1px solid var(--border);
+			border-radius: 24px;
+			background: rgba(255, 255, 255, .72);
+			box-shadow: var(--shadow);
+		}
 		.parent-link, .entry {
 			width: 100%;
 			margin-bottom: 8px;
-			border-radius: 12px;
-			background: #fff;
-			color: #0f172a;
+			border: 1px solid rgba(219, 229, 241, .78);
+			border-radius: 18px;
+			background: var(--panel-solid);
+			color: var(--text);
 			text-decoration: none;
-			box-shadow: 0 1px 3px rgba(15, 23, 42, .08);
+			box-shadow: 0 1px 3px rgba(15, 23, 42, .04);
 		}
 		.parent-link {
 			display: block;
-			padding: 12px 14px;
-			background: #e2e8f0;
+			padding: 13px 15px;
+			background: #f1f5f9;
+			font-weight: 900;
 		}
 		.entry {
 			justify-content: space-between;
 			padding: 10px;
+			transition: border-color .16s ease, transform .16s ease, box-shadow .16s ease;
+		}
+		.entry:hover {
+			border-color: #bfdbfe;
+			transform: translateY(-1px);
+			box-shadow: 0 12px 28px rgba(15, 23, 42, .08);
 		}
 		.entry-link {
 			flex: 1;
 			min-width: 180px;
-			color: #0f172a;
+			color: var(--text);
 			text-decoration: none;
-			padding: 8px 10px;
-			border-radius: 8px;
+			padding: 8px;
+			border-radius: 14px;
 			overflow-wrap: anywhere;
 		}
-		.entry-link:hover { background: #ecfdf5; color: #047857; }
+		.entry-icon {
+			display: grid;
+			place-items: center;
+			flex: 0 0 auto;
+			width: 42px;
+			height: 42px;
+			border-radius: 14px;
+			background: #eff6ff;
+			font-size: 22px;
+		}
+		.entry-main { min-width: 0; display: grid; gap: 3px; }
+		.entry-name { font-weight: 850; }
+		.entry-meta { color: var(--muted); font-size: 12px; }
 		.entry-actions { flex-wrap: wrap; justify-content: flex-end; }
-		.rename-form input { width: 180px; }
+		.empty-state {
+			margin: 0;
+			padding: 36px 18px;
+			text-align: center;
+			color: var(--muted);
+			font-weight: 800;
+		}
 		@media (max-width: 760px) {
 			body { padding: 14px; }
-			header, .entry { align-items: stretch; flex-direction: column; }
+			header, .entry, .toolbar { align-items: stretch; flex-direction: column; }
 			.entry-actions, form { width: 100%; }
-			input, button, .rename-form input { width: 100%; }
+			input, button { width: 100%; }
+			.entry-link { min-width: 0; }
 		}
 	</style>
+	<script>
+		document.addEventListener('click', (event) => {
+			const button = event.target.closest('.rename-button');
+			if (button === null || button.disabled) {
+				return;
+			}
+			const form = button.closest('form');
+			if (form === null) {
+				return;
+			}
+			const currentName = button.dataset.currentName || '';
+			const nextName = window.prompt('请输入新名称', currentName);
+			if (nextName === null) {
+				return;
+			}
+			const trimmedName = nextName.trim();
+			if (trimmedName === '') {
+				window.alert('新名称不能为空');
+				return;
+			}
+			form.elements.namedItem('name').value = trimmedName;
+			form.requestSubmit();
+		});
+	</script>
 </head>
 <body>
+	<main class="app-shell">
 	<header>
-		<h1>R2 Storage</h1>
+		<div class="hero">
+			<div class="brand-badge"><span class="brand-dot"></span><span>R2 WebDAV Console</span></div>
+			<div class="hero-title"><h1>R2 Storage</h1></div>
+			<div class="path-pill">当前位置：${escapeXml(currentPath)}</div>
+		</div>
 		<form method="post" action="${LOGOUT_PATH}"><button class="secondary" type="submit">退出登录</button></form>
 	</header>
 	${renderDirectoryMessage(request)}
 	<section class="toolbar" aria-label="文件管理">
+		<div class="toolbar-title">新建文件夹</div>
 		<form method="post" action="${MKDIR_ACTION_PATH}">
 			${csrfInput}
 			<input type="hidden" name="parent" value="${escapeXml(resourcePath)}">
@@ -1492,7 +1688,8 @@ function renderDirectoryPage(
 			<button type="submit">创建文件夹</button>
 		</form>
 	</section>
-	<nav>${parentLink}${entries || '<p>当前目录为空。</p>'}</nav>
+	<nav>${parentLink}${entries || '<p class="empty-state">当前目录为空，可以先创建一个文件夹。</p>'}</nav>
+	</main>
 </body>
 </html>`;
 }
@@ -2495,6 +2692,7 @@ export default {
 
 		return applySecurityHeaders(response, {
 			contentSecurityPolicy: request.method === 'GET' && new URL(request.url).pathname.endsWith('/'),
+			inlineScript: request.method === 'GET' && new URL(request.url).pathname.endsWith('/'),
 		});
 	},
 };
