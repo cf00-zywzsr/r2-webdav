@@ -30,6 +30,8 @@ wrangler secret put SESSION_SECRET # recommended for browser login cookies
 
 Optional browser-session lifetime in seconds can be configured with `SESSION_MAX_AGE`; it defaults to 7 days and is capped at 30 days.
 
+Basic Auth is disabled by default. To allow WebDAV clients or browser Basic Auth credentials, set `ENABLE_BASIC_AUTH=true` in your Worker environment variables.
+
 When deploying from GitHub Actions, add these repository secrets before running the deploy workflow:
 
 - `CLOUDFLARE_API_TOKEN`
@@ -40,7 +42,7 @@ When deploying from GitHub Actions, add these repository secrets before running 
 
 ## Browser login
 
-Opening the Worker URL in a browser now shows a dedicated login page instead of the browser's Basic Auth popup. Enter the same `USERNAME` and `PASSWORD` secrets there; WebDAV clients can still authenticate with Basic Auth.
+Opening the Worker URL in a browser now shows a dedicated login page instead of the browser's Basic Auth popup. Enter the same `USERNAME` and `PASSWORD` secrets there. WebDAV clients can authenticate with Basic Auth only when `ENABLE_BASIC_AUTH=true`.
 
 The browser UI also supports common object management actions:
 
@@ -48,7 +50,9 @@ The browser UI also supports common object management actions:
 - delete files or folders
 - rename files or folders
 
-Browser sessions use a signed `HttpOnly` cookie, basic same-origin form checks, security response headers, and a small per-isolate login failure throttle. For public deployments, still consider Cloudflare WAF/rate-limiting rules in front of the Worker.
+Browser sessions use a signed `HttpOnly` cookie, security response headers, and a small per-isolate login failure throttle. Login and file-management form posts use basic same-origin form checks. For public deployments, still consider Cloudflare WAF/rate-limiting rules in front of the Worker.
+
+The browser "logout" button clears the cookie session and returns to the login page. If you previously authenticated through the browser's Basic Auth popup, the browser may continue to cache those credentials until the tab/browser is closed or the site's saved credentials are cleared.
 
 ## Development
 

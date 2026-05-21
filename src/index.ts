@@ -19,6 +19,7 @@ export interface Env {
 	PASSWORD: string;
 	SESSION_SECRET?: string;
 	SESSION_MAX_AGE?: string;
+	ENABLE_BASIC_AUTH?: string;
 }
 
 async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean = false) {
@@ -605,6 +606,11 @@ function getSessionMaxAgeSeconds(env: Env): number {
 	return Math.min(Math.floor(configuredMaxAge), 30 * 24 * 60 * 60);
 }
 
+function isBasicAuthEnabled(env: Env): boolean {
+	let value = env.ENABLE_BASIC_AUTH?.trim().toLowerCase();
+	return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+}
+
 async function signSessionToken(username: string, sessionSecret: string, issuedAt: number): Promise<string> {
 	const encoder = new TextEncoder();
 	const key = await crypto.subtle.importKey(
@@ -791,8 +797,18 @@ function clearLoginFailures(request: Request): void {
 	loginAttempts.delete(getLoginClientId(request));
 }
 
-function renderLoginPage(nextPath: string, errorMessage: string | null = null, status: number | null = null): Response {
+function renderLoginPage(
+	nextPath: string,
+	errorMessage: string | null = null,
+	status: number | null = null,
+	noticeMessage: string | null = null,
+	basicAuthEnabled: boolean = false,
+): Response {
 	let error = errorMessage ? `<div class="error" role="alert">${escapeXml(errorMessage)}</div>` : '';
+	let notice = noticeMessage ? `<div class="notice">${escapeXml(noticeMessage)}</div>` : '';
+	let basicAuthHint = basicAuthEnabled
+		? 'WebDAV 客户端可继续使用 Basic Auth。'
+		: 'Basic Auth 默认关闭；如需 WebDAV 客户端使用 Basic Auth，请设置 ENABLE_BASIC_AUTH=true。';
 	let page = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -858,6 +874,15 @@ function renderLoginPage(nextPath: string, errorMessage: string | null = null, s
 			color: #991b1b;
 			font-weight: 700;
 		}
+		.notice {
+			margin: 0 0 18px;
+			padding: 12px 14px;
+			border-radius: 12px;
+			background: #dbeafe;
+			color: #1e3a8a;
+			font-weight: 700;
+			line-height: 1.5;
+		}
 		.hint { margin-top: 18px; font-size: 13px; color: #64748b; text-align: center; }
 	</style>
 </head>
@@ -866,6 +891,7 @@ function renderLoginPage(nextPath: string, errorMessage: string | null = null, s
 		<h1>登录 R2 Storage</h1>
 		<p>请输入 WebDAV 用户名和密码，登录后会回到原访问路径。</p>
 		${error}
+		${notice}
 		<form method="post" action="${LOGIN_PATH}?next=${encodeURIComponent(nextPath)}" autocomplete="on">
 			<label for="username">用户名</label>
 			<input id="username" name="username" type="text" autocomplete="username" required autofocus>
@@ -873,7 +899,7 @@ function renderLoginPage(nextPath: string, errorMessage: string | null = null, s
 			<input id="password" name="password" type="password" autocomplete="current-password" required>
 			<button type="submit">登录</button>
 		</form>
-		<div class="hint">WebDAV 客户端仍可继续使用 Basic Auth。</div>
+		<div class="hint">${escapeXml(basicAuthHint)}</div>
 	</main>
 </body>
 </html>`;
@@ -892,9 +918,14 @@ async function handleLoginRoute(
 	password: string,
 	sessionSecret: string,
 	sessionMaxAgeSeconds: number,
+	basicAuthEnabled: boolean,
 ): Promise<Response> {
 	if (request.method === 'GET' || request.method === 'HEAD') {
-		return renderLoginPage(getSafeNextPath(request));
+		let notice =
+			new URL(request.url).searchParams.get('logged_out') === '1' && basicAuthEnabled
+				? '已退出浏览器会话。若之前通过 Basic Auth 弹窗登录，浏览器可能仍会缓存凭据；请关闭浏览器标签页或清除站点凭据以完全退出。'
+				: null;
+		return renderLoginPage(getSafeNextPath(request), null, null, notice, basicAuthEnabled);
 	}
 
 	if (request.method !== 'POST') {
@@ -907,7 +938,7 @@ async function handleLoginRoute(
 		return new Response('Forbidden', { status: 403 });
 	}
 	if (isLoginRateLimited(request)) {
-		return renderLoginPage(getSafeNextPath(request), '登录失败次数过多，请稍后再试。', 429);
+		return renderLoginPage(getSafeNextPath(request), '登录失败次数过多，请稍后再试。', 429, null, basicAuthEnabled);
 	}
 
 	let nextPath = getSafeNextPath(request);
@@ -917,7 +948,7 @@ async function handleLoginRoute(
 
 	if (!isCredentialPairAuthorized(submittedUsername, submittedPassword, username, password)) {
 		recordLoginFailure(request);
-		return renderLoginPage(nextPath, '用户名或密码不正确，请重试。');
+		return renderLoginPage(nextPath, '用户名或密码不正确，请重试。', null, null, basicAuthEnabled);
 	}
 	clearLoginFailures(request);
 
@@ -927,10 +958,13 @@ async function handleLoginRoute(
 }
 
 function handleLogoutRoute(request: Request): Response {
-	if (!isSameOriginFormPost(request)) {
-		return new Response('Forbidden', { status: 403 });
+	if (request.method !== 'GET' && request.method !== 'HEAD' && request.method !== 'POST') {
+		return new Response('Method Not Allowed', {
+			status: 405,
+			headers: { Allow: 'GET, HEAD, POST' },
+		});
 	}
-	return redirectResponse(`${LOGIN_PATH}?next=/`, 303, {
+	return redirectResponse(`${LOGIN_PATH}?next=/&logged_out=1`, 303, {
 		'Set-Cookie': clearSessionCookie(request.url),
 	});
 }
@@ -2311,16 +2345,20 @@ async function isRequestAuthorized(
 	password: string,
 	sessionSecret: string,
 	sessionMaxAgeSeconds: number,
+	basicAuthEnabled: boolean,
 ): Promise<boolean> {
 	return (
-		is_authorized(request.headers.get('Authorization') ?? '', username, password) ||
+		(basicAuthEnabled && is_authorized(request.headers.get('Authorization') ?? '', username, password)) ||
 		(await isValidSessionCookie(request.headers.get('Cookie'), username, sessionSecret, sessionMaxAgeSeconds))
 	);
 }
 
-function unauthorizedResponse(request: Request): Response {
+function unauthorizedResponse(request: Request, basicAuthEnabled: boolean): Response {
 	if (shouldUseLoginPage(request)) {
 		return redirectResponse(`${LOGIN_PATH}?next=${encodeURIComponent(getCurrentPathWithSearch(request))}`);
+	}
+	if (!basicAuthEnabled) {
+		return new Response('Unauthorized', { status: 401 });
 	}
 	return new Response('Unauthorized', {
 		status: 401,
@@ -2335,11 +2373,19 @@ export default {
 		const { bucket } = env;
 		const sessionSecret = getSessionSecret(env);
 		const sessionMaxAgeSeconds = getSessionMaxAgeSeconds(env);
+		const basicAuthEnabled = isBasicAuthEnabled(env);
 		const { pathname } = new URL(request.url);
 
 		if (pathname === LOGIN_PATH) {
 			return applySecurityHeaders(
-				await handleLoginRoute(request, env.USERNAME, env.PASSWORD, sessionSecret, sessionMaxAgeSeconds),
+				await handleLoginRoute(
+					request,
+					env.USERNAME,
+					env.PASSWORD,
+					sessionSecret,
+					sessionMaxAgeSeconds,
+					basicAuthEnabled,
+				),
 				{ contentSecurityPolicy: true },
 			);
 		}
@@ -2349,9 +2395,16 @@ export default {
 
 		if (
 			request.method !== 'OPTIONS' &&
-			!(await isRequestAuthorized(request, env.USERNAME, env.PASSWORD, sessionSecret, sessionMaxAgeSeconds))
+			!(await isRequestAuthorized(
+				request,
+				env.USERNAME,
+				env.PASSWORD,
+				sessionSecret,
+				sessionMaxAgeSeconds,
+				basicAuthEnabled,
+			))
 		) {
-			return applySecurityHeaders(unauthorizedResponse(request));
+			return applySecurityHeaders(unauthorizedResponse(request, basicAuthEnabled));
 		}
 
 		if (pathname.startsWith(`${ACTION_PREFIX}/`)) {
