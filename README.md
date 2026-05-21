@@ -26,7 +26,17 @@ wrangler secret put PASSWORD
 wrangler secret put SESSION_SECRET # recommended for browser login cookies
 ```
 
+`SESSION_SECRET` is used to sign the browser login session cookie. It is optional: when it is not configured, the Worker falls back to using `PASSWORD` as the signing secret. For better separation between the WebDAV password and browser-session signing key, configure a long random `SESSION_SECRET` value.
+
 Optional browser-session lifetime in seconds can be configured with `SESSION_MAX_AGE`; it defaults to 7 days and is capped at 30 days.
+
+When deploying from GitHub Actions, add these repository secrets before running the deploy workflow:
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `USERNAME`
+- `PASSWORD`
+- `SESSION_SECRET`
 
 ## Browser login
 

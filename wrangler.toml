@@ -1,6 +1,7 @@
 compatibility_date = "2023-10-16"
 main = "src/index.ts"
 name = "r2-webdav"
+keep_vars = true
 
 compatibility_flags = ["nodejs_compat"]
 
