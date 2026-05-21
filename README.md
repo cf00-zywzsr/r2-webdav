@@ -1,6 +1,6 @@
 # r2-webdav
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/abersheeran/r2-webdav)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cf00-zywzsr/r2-webdav)
 
 Use Cloudflare Workers to provide a WebDav interface for Cloudflare R2.
 
@@ -31,6 +31,22 @@ wrangler secret put SESSION_SECRET # recommended for browser login cookies
 Optional browser-session lifetime in seconds can be configured with `SESSION_MAX_AGE`; it defaults to 7 days and is capped at 30 days.
 
 Basic Auth is enabled by default for WebDAV client compatibility. To disable browser or WebDAV Basic Auth credentials, set `ENABLE_BASIC_AUTH=false` in your Worker environment variables.
+
+## Cloudflare Deploy Button
+
+The deploy button above points at this repository and uses the repository's `wrangler.toml` for Worker deployment settings, including:
+
+- Worker entrypoint: `main = "src/index.ts"`
+- Worker name: `name = "r2-webdav"`
+- R2 binding name: `bucket`
+- R2 bucket name: `webdav` unless you change `wrangler.toml`
+
+Runtime values are read from the Worker environment/secrets and are exposed to the Worker as the `env` object in `src/index.ts`:
+
+- Required: `USERNAME`, `PASSWORD`
+- Optional: `SESSION_SECRET`, `SESSION_MAX_AGE`, `ENABLE_BASIC_AUTH`
+
+For Deploy Button based setup, `.dev.vars.example` documents the secrets/variables that Cloudflare should ask you to configure. Replace the example values during setup; do not keep `admin`, `change-me`, or the sample `SESSION_SECRET` in a public deployment. For CLI deploys, set the same values with `wrangler secret put ...` or in the Cloudflare dashboard under Worker **Settings → Variables and Secrets**.
 
 When deploying from GitHub Actions, add these repository secrets before running the deploy workflow:
 

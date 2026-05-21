@@ -1,0 +1,13 @@
+# Required login credentials for browser sessions and Basic Auth.
+USERNAME=admin
+PASSWORD=change-me
+
+# Recommended: separate browser-session signing secret from PASSWORD.
+SESSION_SECRET=change-me-to-a-long-random-secret
+
+# Optional: browser-session lifetime in seconds. Defaults to 604800 (7 days), capped at 2592000 (30 days).
+# SESSION_MAX_AGE=604800
+
+# Optional: Basic Auth is enabled by default for WebDAV client compatibility.
+# Set to false, 0, no, or off to disable Basic Auth challenges and credentials.
+# ENABLE_BASIC_AUTH=true
