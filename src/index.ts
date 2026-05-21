@@ -934,9 +934,6 @@ async function handleLoginRoute(
 			headers: { Allow: 'GET, HEAD, POST' },
 		});
 	}
-	if (!isSameOriginFormPost(request)) {
-		return new Response('Forbidden', { status: 403 });
-	}
 	if (isLoginRateLimited(request)) {
 		return renderLoginPage(getSafeNextPath(request), '登录失败次数过多，请稍后再试。', 429, null, basicAuthEnabled);
 	}
