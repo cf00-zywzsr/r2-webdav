@@ -30,7 +30,7 @@ wrangler secret put SESSION_SECRET # recommended for browser login cookies
 
 Optional browser-session lifetime in seconds can be configured with `SESSION_MAX_AGE`; it defaults to 7 days and is capped at 30 days.
 
-Basic Auth is disabled by default. To allow WebDAV clients or browser Basic Auth credentials, set `ENABLE_BASIC_AUTH=true` in your Worker environment variables.
+Basic Auth is enabled by default for WebDAV client compatibility. To disable browser or WebDAV Basic Auth credentials, set `ENABLE_BASIC_AUTH=false` in your Worker environment variables.
 
 When deploying from GitHub Actions, add these repository secrets before running the deploy workflow:
 
@@ -42,7 +42,7 @@ When deploying from GitHub Actions, add these repository secrets before running 
 
 ## Browser login
 
-Opening the Worker URL in a browser now shows a dedicated login page instead of the browser's Basic Auth popup. Enter the same `USERNAME` and `PASSWORD` secrets there. WebDAV clients can authenticate with Basic Auth only when `ENABLE_BASIC_AUTH=true`.
+Opening the Worker URL in a browser now shows a dedicated login page instead of the browser's Basic Auth popup. Enter the same `USERNAME` and `PASSWORD` secrets there. WebDAV clients can authenticate with Basic Auth unless `ENABLE_BASIC_AUTH=false`.
 
 The browser UI also supports common object management actions:
 

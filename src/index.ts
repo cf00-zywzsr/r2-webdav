@@ -608,7 +608,7 @@ function getSessionMaxAgeSeconds(env: Env): number {
 
 function isBasicAuthEnabled(env: Env): boolean {
 	let value = env.ENABLE_BASIC_AUTH?.trim().toLowerCase();
-	return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+	return value !== '0' && value !== 'false' && value !== 'no' && value !== 'off';
 }
 
 async function signSessionToken(username: string, sessionSecret: string, issuedAt: number): Promise<string> {
@@ -622,6 +622,28 @@ async function signSessionToken(username: string, sessionSecret: string, issuedA
 	);
 	const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(`${username}:${issuedAt}`));
 	return `${issuedAt}.${base64UrlEncode(new Uint8Array(signature))}`;
+}
+
+async function signFormCsrfToken(tokenSource: string, sessionSecret: string): Promise<string> {
+	const encoder = new TextEncoder();
+	const key = await crypto.subtle.importKey(
+		'raw',
+		encoder.encode(sessionSecret),
+		{ name: 'HMAC', hash: 'SHA-256' },
+		false,
+		['sign'],
+	);
+	const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(`form:${tokenSource}`));
+	return base64UrlEncode(new Uint8Array(signature));
+}
+
+async function getFormCsrfToken(request: Request, sessionSecret: string): Promise<string | null> {
+	let tokenSource =
+		getCookieValue(request.headers.get('Cookie'), AUTH_COOKIE_NAME) ?? request.headers.get('Authorization');
+	if (tokenSource === null || tokenSource === '') {
+		return null;
+	}
+	return await signFormCsrfToken(tokenSource, sessionSecret);
 }
 
 async function createSessionCookie(
@@ -808,7 +830,7 @@ function renderLoginPage(
 	let notice = noticeMessage ? `<div class="notice">${escapeXml(noticeMessage)}</div>` : '';
 	let basicAuthHint = basicAuthEnabled
 		? 'WebDAV 客户端可继续使用 Basic Auth。'
-		: 'Basic Auth 默认关闭；如需 WebDAV 客户端使用 Basic Auth，请设置 ENABLE_BASIC_AUTH=true。';
+		: 'Basic Auth 已关闭；如需 WebDAV 客户端使用 Basic Auth，请设置 ENABLE_BASIC_AUTH=true。';
 	let page = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1114,14 +1136,24 @@ async function handleRenameAction(request: Request, bucket: R2Bucket): Promise<R
 	return redirectToCollection(request, parentPath, { notice: '已重命名' });
 }
 
-async function handleActionRoute(request: Request, bucket: R2Bucket): Promise<Response> {
+async function isValidActionFormPost(request: Request, sessionSecret: string): Promise<boolean> {
+	let expectedToken = await getFormCsrfToken(request, sessionSecret);
+	if (expectedToken === null) {
+		return false;
+	}
+	let form = await request.clone().formData();
+	let submittedToken = getFormValue(form, 'csrf');
+	return timingSafeEqual(new TextEncoder().encode(submittedToken), new TextEncoder().encode(expectedToken));
+}
+
+async function handleActionRoute(request: Request, bucket: R2Bucket, sessionSecret: string): Promise<Response> {
 	if (request.method !== 'POST') {
 		return new Response('Method Not Allowed', {
 			status: 405,
 			headers: { Allow: 'POST' },
 		});
 	}
-	if (!isSameOriginFormPost(request)) {
+	if (!(await isValidActionFormPost(request, sessionSecret))) {
 		return new Response('Forbidden', { status: 403 });
 	}
 
@@ -1308,22 +1340,29 @@ function getResourceBasename(resourcePath: string): string {
 	return resourcePath.split('/').pop() ?? resourcePath;
 }
 
-function renderDirectoryEntry(object: R2Object, prefix: string): string {
+function renderCsrfInput(csrfToken: string | null): string {
+	return csrfToken === null ? '' : `<input type="hidden" name="csrf" value="${escapeXml(csrfToken)}">`;
+}
+
+function renderDirectoryEntry(object: R2Object, prefix: string, csrfToken: string | null): string {
 	let isCollection = object.customMetadata?.resourcetype === '<collection />';
 	let href = getResourceHref(object.key, isCollection);
 	let displayName = object.httpMetadata?.contentDisposition ?? object.key.slice(prefix.length);
 	let defaultRenameValue = getResourceBasename(object.key);
 	let disabled = isReservedResourcePath(object.key) ? ' disabled title="系统保留路径不能在 Web 界面管理"' : '';
+	let csrfInput = renderCsrfInput(csrfToken);
 
 	return `<div class="entry">
 	<a class="entry-link" href="${escapeXml(href)}">${escapeXml(displayName)}</a>
 	<div class="entry-actions">
 		<form method="post" action="${RENAME_ACTION_PATH}" class="rename-form">
+			${csrfInput}
 			<input type="hidden" name="target" value="${escapeXml(object.key)}">
 			<input name="name" value="${escapeXml(defaultRenameValue)}" aria-label="新名称">
 			<button type="submit"${disabled}>重命名</button>
 		</form>
 		<form method="post" action="${DELETE_ACTION_PATH}">
+			${csrfInput}
 			<input type="hidden" name="target" value="${escapeXml(object.key)}">
 			<button class="danger" type="submit"${disabled}>删除</button>
 		</form>
@@ -1331,8 +1370,14 @@ function renderDirectoryEntry(object: R2Object, prefix: string): string {
 </div>`;
 }
 
-function renderDirectoryPage(request: Request, resourcePath: string, entries: string): string {
+function renderDirectoryPage(
+	request: Request,
+	resourcePath: string,
+	entries: string,
+	csrfToken: string | null,
+): string {
 	let parentLink = resourcePath === '' ? '' : `<a class="parent-link" href="../">..</a>`;
+	let csrfInput = renderCsrfInput(csrfToken);
 	return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1441,6 +1486,7 @@ function renderDirectoryPage(request: Request, resourcePath: string, entries: st
 	${renderDirectoryMessage(request)}
 	<section class="toolbar" aria-label="文件管理">
 		<form method="post" action="${MKDIR_ACTION_PATH}">
+			${csrfInput}
 			<input type="hidden" name="parent" value="${escapeXml(resourcePath)}">
 			<input name="name" placeholder="新文件夹名称" aria-label="新文件夹名称" required>
 			<button type="submit">创建文件夹</button>
@@ -1451,8 +1497,8 @@ function renderDirectoryPage(request: Request, resourcePath: string, entries: st
 </html>`;
 }
 
-async function handle_head(request: Request, bucket: R2Bucket): Promise<Response> {
-	let response = await handle_get(request, bucket);
+async function handle_head(request: Request, bucket: R2Bucket, sessionSecret: string): Promise<Response> {
+	let response = await handle_get(request, bucket, sessionSecret);
 	return new Response(null, {
 		status: response.status,
 		statusText: response.statusText,
@@ -1460,7 +1506,7 @@ async function handle_head(request: Request, bucket: R2Bucket): Promise<Response
 	});
 }
 
-async function handle_get(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_get(request: Request, bucket: R2Bucket, sessionSecret: string): Promise<Response> {
 	let resource_path = make_resource_path(request);
 
 	if (request.url.endsWith('/')) {
@@ -1473,14 +1519,15 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 
 		let page = '',
 			prefix = resource_path === '' ? '' : `${resource_path}/`;
+		let csrfToken = await getFormCsrfToken(request, sessionSecret);
 
 		for await (const object of listAll(bucket, prefix)) {
 			if (object.key === resource_path) {
 				continue;
 			}
-			page += renderDirectoryEntry(object, prefix);
+			page += renderDirectoryEntry(object, prefix, csrfToken);
 		}
-		let pageSource = renderDirectoryPage(request, resource_path, page);
+		let pageSource = renderDirectoryPage(request, resource_path, page, csrfToken);
 
 		return new Response(pageSource, {
 			status: 200,
@@ -2271,7 +2318,7 @@ const SUPPORT_METHODS = [
 	'UNLOCK',
 ];
 
-async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Response> {
+async function dispatch_handler(request: Request, bucket: R2Bucket, sessionSecret: string): Promise<Response> {
 	switch (request.method) {
 		case 'OPTIONS': {
 			return new Response(null, {
@@ -2283,10 +2330,10 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 			});
 		}
 		case 'HEAD': {
-			return await handle_head(request, bucket);
+			return await handle_head(request, bucket, sessionSecret);
 		}
 		case 'GET': {
-			return await handle_get(request, bucket);
+			return await handle_get(request, bucket, sessionSecret);
 		}
 		case 'PUT': {
 			return await handle_put(request, bucket);
@@ -2405,10 +2452,12 @@ export default {
 		}
 
 		if (pathname.startsWith(`${ACTION_PREFIX}/`)) {
-			return applySecurityHeaders(await handleActionRoute(request, bucket), { contentSecurityPolicy: true });
+			return applySecurityHeaders(await handleActionRoute(request, bucket, sessionSecret), {
+				contentSecurityPolicy: true,
+			});
 		}
 
-		let response: Response = await dispatch_handler(request, bucket);
+		let response: Response = await dispatch_handler(request, bucket, sessionSecret);
 
 		// Set CORS headers
 		response.headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') ?? '*');
